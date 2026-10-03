@@ -302,13 +302,12 @@ impl FileTree {
                     (id, true)
                 }
             }
-            Entry::Vacant(entry) => {
+            Entry::Vacant(_) => {
                 let Some(fs_meta) = fs_meta else {
                     return (NodeId::NONE, true);
                 };
                 let meta = NodeMeta::new(&fs_meta);
                 let id = NodeId::from(self.nodes.len());
-                entry.insert(id);
                 let parent = change.path.parent().and_then(|parent| {
                     let hash = self.hasher.hash_one(parent.as_os_str());
                     self.path_table
@@ -317,14 +316,8 @@ impl FileTree {
                 });
                 let Some(parent) = parent else {
                     log::error!("for {change:?} the parent wasn't yet in the tree! Ignoring...");
-                    // remove inserted entry again as insertion failed
-                    self.path_table
-                        .find_entry(hash, |&tree_id| tree_id == id)
-                        .unwrap()
-                        .remove();
                     return (NodeId::NONE, true);
                 };
-                self.add_child(parent, id);
                 recursive = mark_recursive || self[parent].flags.contains(Flags::RECURSIVE);
                 let flags = if recursive {
                     Flags::RECURSIVE
@@ -338,6 +331,11 @@ impl FileTree {
                     inode: fs_meta.inode,
                     children: DirId::NONE,
                 });
+                // Publish only after the node exists; parent lookup may probe this entry.
+                self.path_table.insert_unique(hash, id, |id| {
+                    self.hasher.hash_one(&self.nodes[id.idx()].path)
+                });
+                self.add_child(parent, id);
                 if !fs_meta.is_dir {
                     emit_event(change.path.clone(), EventType::Create)
                 } else if recursive && fs_meta.size != 0 {
@@ -380,27 +378,18 @@ impl FileTree {
                 self[id].flags.insert(Flags::RECURSIVE);
                 Some(id)
             }
-            Entry::Vacant(entry) => {
+            Entry::Vacant(_) => {
                 let fs_meta = Metadata::for_path(&path)?;
                 let meta = NodeMeta::new(&fs_meta);
                 let id = NodeId::from(self.nodes.len());
-                entry.insert(id);
                 let parent = path.parent().and_then(|parent| {
                     let hash = self.hasher.hash_one(parent.as_os_str());
                     self.path_table
                         .find(hash, |&id| self.nodes[id.idx()].path == parent)
                         .copied()
                 });
-                if let Some(parent) = parent {
-                    self.add_child(parent, id);
-                } else if !root {
+                if parent.is_none() && !root {
                     log::error!("for {path:?} the parent wasn't yet in the tree! Ignoring...");
-                    // Use id comparison instead of accessing self.nodes since the node
-                    // hasn't been added yet (would cause index out of bounds)
-                    self.path_table
-                        .find_entry(hash, |&tree_id| tree_id == id)
-                        .unwrap()
-                        .remove();
                     return None;
                 };
                 self.nodes.push(FsNode {
@@ -416,6 +405,13 @@ impl FileTree {
                         Flags::empty()
                     },
                 });
+                // Publish only after the node exists; parent lookup may probe this entry.
+                self.path_table.insert_unique(hash, id, |id| {
+                    self.hasher.hash_one(&self.nodes[id.idx()].path)
+                });
+                if let Some(parent) = parent {
+                    self.add_child(parent, id);
+                }
                 if fs_meta.is_dir && (recursive || root) && fs_meta.size != 0 {
                     self.reserve_dir(id, fs_meta.size);
                 }
@@ -747,5 +743,73 @@ mod tests {
     fn valid_ids_index_normally() {
         assert_eq!(NodeId::from(7usize).idx(), 7);
         assert_eq!(DirId::from(3usize).idx(), 3);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    // Choose a path whose table probe also visits its absent parent's entry.
+    // This forces the equality callback to inspect the newly published NodeId.
+    fn colliding_path(tree: &mut FileTree, parent: &std::path::Path) -> CanonicalPathBuf {
+        let parent_hash = tree.hasher.hash_one(parent.as_os_str());
+        for i in 0..1_000_000 {
+            let path = CanonicalPathBuf::assert_canonicalized(&parent.join(format!("child-{i}")));
+            let hash = tree.hasher.hash_one(&path);
+            tree.path_table
+                .insert_unique(hash, NodeId::from(0), |_| unreachable!());
+            let collides = tree.path_table.find(parent_hash, |_| true).is_some();
+            tree.path_table.clear();
+            if collides {
+                std::fs::write(path.as_std_path(), b"test").unwrap();
+                return path;
+            }
+        }
+        panic!("could not find a colliding probe");
+    }
+
+    #[test]
+    fn missing_parent_change_keeps_tree_consistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().canonicalize().unwrap();
+        let mut tree = FileTree::new();
+        let path = colliding_path(&mut tree, &parent);
+        let (id, _) = tree.apply_change(
+            &PendingChange {
+                path,
+                flags: pending::Flags::ORIGIN_WATCHER,
+            },
+            &mut Vec::new(),
+            |_, _| panic!("an orphan must not emit events"),
+        );
+        assert!(id.is_none());
+        assert!(tree.nodes.is_empty());
+        assert!(tree.path_table.is_empty());
+    }
+
+    #[test]
+    fn missing_parent_add_keeps_tree_consistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().canonicalize().unwrap();
+        let mut tree = FileTree::new();
+        let path = colliding_path(&mut tree, &parent);
+        assert!(tree.add(path, false, false).is_none());
+        assert!(tree.nodes.is_empty());
+        assert!(tree.path_table.is_empty());
+    }
+
+    #[test]
+    fn root_with_missing_parent_can_be_added() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().canonicalize().unwrap();
+        let mut tree = FileTree::new();
+        let path = colliding_path(&mut tree, &parent);
+        std::fs::remove_file(path.as_std_path()).unwrap();
+        std::fs::create_dir(path.as_std_path()).unwrap();
+        assert!(tree.add_root(path.clone(), true).is_some());
+        assert_eq!(tree.nodes.len(), 1);
+        assert_eq!(tree.path_table.len(), 1);
+        assert_eq!(tree.nodes[0].path, path);
     }
 }

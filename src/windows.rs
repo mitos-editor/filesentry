@@ -191,7 +191,7 @@ impl WindowsWatcher {
                 .collect();
             let name = String::from_utf16_lossy(&name_u16);
             let path = root.join(OsStr::new(&name));
-            if !filter.ignore_path(path.as_std_path(), None) {
+            if !filter.ignore_path_rec(path.as_std_path(), None) {
                 match action {
                     FILE_ACTION_ADDED
                     | FILE_ACTION_REMOVED
@@ -367,4 +367,61 @@ impl crate::backend::Backend for WindowsWatcher {
     }
 
     fn refresh_config(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Filter, Watcher};
+
+    struct IgnoreTargetDirectory;
+
+    impl Filter for IgnoreTargetDirectory {
+        fn ignore_path(&self, path: &std::path::Path, is_dir: Option<bool>) -> bool {
+            is_dir == Some(true) && path.file_name().is_some_and(|name| name == "target")
+        }
+    }
+
+    fn notification(action: u32, name: &str) -> Vec<u8> {
+        let name: Vec<u16> = name.encode_utf16().collect();
+        let mut record = Vec::new();
+        record.extend_from_slice(&0u32.to_ne_bytes()); // NextEntryOffset: last record
+        record.extend_from_slice(&action.to_ne_bytes());
+        record.extend_from_slice(&((name.len() * 2) as u32).to_ne_bytes());
+        for unit in name {
+            record.extend_from_slice(&unit.to_ne_bytes());
+        }
+        record
+    }
+
+    #[test]
+    fn notification_records_respect_ignored_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = CanonicalPathBuf::assert_canonicalized(&tmp.path().canonicalize().unwrap());
+        let watcher = Watcher::new().unwrap();
+        let _shutdown = watcher.shutdown_guard();
+        watcher.set_filter(Arc::new(IgnoreTargetDirectory), false);
+
+        // Directory-only patterns must match ancestors even when the leaf's
+        // type is unknown, including notifications for already removed files.
+        for action in [
+            FILE_ACTION_ADDED,
+            FILE_ACTION_REMOVED,
+            FILE_ACTION_MODIFIED,
+            FILE_ACTION_RENAMED_OLD_NAME,
+            FILE_ACTION_RENAMED_NEW_NAME,
+        ] {
+            watcher
+                .notify
+                .handle_records(&root, &notification(action, "target\\debug\\output.txt"));
+            assert!(watcher.notify.changes.lock().is_empty());
+        }
+
+        watcher
+            .notify
+            .handle_records(&root, &notification(FILE_ACTION_MODIFIED, "src\\main.rs"));
+        let changes: Vec<_> = watcher.notify.changes.lock().drain().collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, root.join(OsStr::new("src\\main.rs")));
+    }
 }
