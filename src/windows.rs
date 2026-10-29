@@ -135,6 +135,9 @@ impl WindowsWatcher {
                 continue;
             }
             let mut roots = self.roots.lock().unwrap();
+            if self.is_shutdown() {
+                break;
+            }
             let Some(root) = roots.get_mut(key) else {
                 continue;
             };
@@ -150,6 +153,9 @@ impl WindowsWatcher {
                 drop(roots); // don't hold the lock across change processing
                 self.handle_records(&path, &buf);
                 roots = self.roots.lock().unwrap();
+                if self.is_shutdown() {
+                    break;
+                }
                 let Some(root) = roots.get_mut(key) else {
                     continue;
                 };
@@ -220,6 +226,10 @@ impl Drop for WindowsWatcher {
         if !self.is_shutdown() {
             self.shutdown();
         }
+        // The completion thread owns an Arc, so it has stopped using the port
+        // before this runs. Closing it in shutdown could race a pending dequeue
+        // and let that thread use a recycled handle.
+        unsafe { CloseHandle(self.iocp) };
     }
 }
 
@@ -257,6 +267,14 @@ impl crate::backend::Backend for WindowsWatcher {
     fn watch_dir(&self, path: CanonicalPathBuf, recursive: bool) -> io::Result<()> {
         // watch_subtree covers descendants, so only roots open a handle.
         let mut roots = self.roots.lock().unwrap();
+        // The worker can still be crawling when shutdown begins. Check under
+        // the same lock as teardown so no read can outlive its root storage.
+        if self.is_shutdown() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "watcher is shut down",
+            ));
+        }
         // Skip only if an existing watch already covers `path`: the exact directory,
         // or a *recursive* ancestor (a non-recursive ancestor does not watch this
         // path's subtree, so it must still get its own watch).
@@ -341,16 +359,16 @@ impl crate::backend::Backend for WindowsWatcher {
                     // to the port and the file handle is not a reliable wait object;
                     // `GetOverlappedResult(bWait=TRUE)` waits on `root.overlapped.hEvent`
                     // (`root.event`) instead, which the kernel signals on completion.
-                    // `CancelIoEx` returns 0 when no read is pending — nothing to wait for.
-                    if CancelIoEx(root.handle, &root.overlapped) != 0 {
-                        let mut transferred = 0u32;
-                        GetOverlappedResult(
-                            root.handle,
-                            &root.overlapped,
-                            &mut transferred,
-                            1, // bWait = TRUE
-                        );
-                    }
+                    // Cancellation can lose a race with completion, so wait even
+                    // when CancelIoEx reports that no request was found.
+                    CancelIoEx(root.handle, &root.overlapped);
+                    let mut transferred = 0u32;
+                    GetOverlappedResult(
+                        root.handle,
+                        &root.overlapped,
+                        &mut transferred,
+                        1, // bWait = TRUE
+                    );
                     CloseHandle(root.handle);
                     CloseHandle(root.event);
                 }
@@ -358,7 +376,6 @@ impl crate::backend::Backend for WindowsWatcher {
             // The kernel is done with every buffer/OVERLAPPED, so freeing the Boxes is safe.
             roots.clear();
         }
-        unsafe { CloseHandle(self.iocp) };
         self.changes.notify();
     }
 
@@ -373,6 +390,64 @@ impl crate::backend::Backend for WindowsWatcher {
 mod tests {
     use super::*;
     use crate::{Filter, Watcher};
+
+    #[test]
+    fn shutdown_rejects_new_watches_and_keeps_completion_port_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = CanonicalPathBuf::assert_canonicalized(&tmp.path().canonicalize().unwrap());
+        let watcher = Watcher::new().unwrap();
+        watcher.notify.watch_dir(root.clone(), true).unwrap();
+        watcher.shutdown();
+        watcher.shutdown(); // idempotent while the completion thread exits
+
+        let err = watcher.notify.watch_dir(root, true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert!(watcher.notify.roots.lock().unwrap().is_empty());
+
+        // The port must remain valid until the last owner (including the
+        // completion thread) is gone, even though native reads are cancelled.
+        let mut flags = 0;
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::Foundation::GetHandleInformation(
+                    watcher.notify.iocp,
+                    &mut flags,
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn shutdown_races_with_watch_registration_and_notifications() {
+        use std::sync::Barrier;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = CanonicalPathBuf::assert_canonicalized(&tmp.path().canonicalize().unwrap());
+        let child = tmp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let child = CanonicalPathBuf::assert_canonicalized(&child.canonicalize().unwrap());
+        for _ in 0..64 {
+            let watcher = Watcher::new().unwrap();
+            watcher.notify.watch_dir(root.clone(), false).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let register = watcher.clone();
+            let ready = barrier.clone();
+            let child = child.clone();
+            let worker = thread::spawn(move || {
+                ready.wait();
+                match register.notify.watch_dir(child, true) {
+                    Ok(()) => {}
+                    Err(err) => assert_eq!(err.kind(), io::ErrorKind::BrokenPipe),
+                }
+            });
+            std::fs::write(tmp.path().join("notification"), b"change").unwrap();
+            barrier.wait();
+            watcher.shutdown();
+            worker.join().unwrap();
+            assert!(watcher.notify.roots.lock().unwrap().is_empty());
+        }
+    }
 
     struct IgnoreTargetDirectory;
 
