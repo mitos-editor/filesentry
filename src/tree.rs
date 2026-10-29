@@ -585,7 +585,7 @@ impl FileTree {
                 if self[node].meta.is_dir() && recursive {
                     add_watch(self[node].path.clone())
                 }
-            } else {
+            } else if child.file_type().is_dir() {
                 walk.skip_current_dir()
             }
         }
@@ -749,6 +749,42 @@ mod tests {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    /// `add` returns `None` for entries it doesn't track (e.g. a symlink, which
+    /// `lstat` reports as neither file nor dir). The crawl must only skip the
+    /// subtree of a directory: `skip_current_dir` on a non-directory skips the
+    /// rest of its parent, so every sibling listed after the symlink went unwatched.
+    #[test]
+    #[cfg(unix)]
+    fn crawl_root_watches_siblings_after_symlink() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root_path = dir.path().canonicalize().unwrap();
+        fs::write(root_path.join("target"), b"x").unwrap();
+        let dirs: Vec<_> = (0..32).map(|i| root_path.join(format!("d{i}"))).collect();
+        for (i, dir) in dirs.iter().enumerate() {
+            if i == dirs.len() / 2 {
+                std::os::unix::fs::symlink("target", root_path.join("link")).unwrap();
+            }
+            fs::create_dir(dir).unwrap();
+        }
+
+        let mut tree = FileTree::new();
+        let root = tree
+            .add_root(CanonicalPathBuf::assert_canonicalized(&root_path), true)
+            .unwrap();
+        let mut watched = Vec::new();
+        tree.crawl_root(root, true, &(), |path| watched.push(path));
+
+        for dir in &dirs {
+            assert!(
+                watched.iter().any(|path| path.as_std_path() == dir),
+                "{} not watched, got {watched:?}",
+                dir.display()
+            );
+        }
+    }
 
     // Choose a path whose table probe also visits its absent parent's entry.
     // This forces the equality callback to inspect the newly published NodeId.
